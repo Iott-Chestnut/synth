@@ -1,9 +1,10 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <bitset>
+#include <HardwareTimer.h>
 
 //Constants
-const uint32_t interval = 100; //Display update interval
+const uint32_t interval = 100; //Display update interval (OLED + LED)
 
 //Pin definitions
 //Row select and enable
@@ -37,7 +38,22 @@ const int HKOE_BIT = 6;
 //Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-//Function to set outputs using key matrix
+// Global: accessed by ISR + main loop
+volatile uint32_t currentStepSize = 0;
+
+// Debug: ISR call counter
+volatile uint32_t isrCount = 0;
+
+// Timer per brief (TIM1)
+HardwareTimer sampleTimer(TIM1);
+
+
+const uint32_t stepSizes[12] = {
+  51076057, 54113197, 57330935, 60740010,
+  64351799, 68178356, 72232452, 76527617,
+  81078186, 85899346, 91007187, 96418756
+};
+
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
   digitalWrite(RA0_PIN, bitIdx & 0x01);
@@ -49,12 +65,8 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
 }
 
-/* =========================
-   PART 2: READ INPUTS
-   ========================= */
 
-// Read the 4 column inputs and return as bitset<4>.
-// result[0]=C0, result[1]=C1, result[2]=C2, result[3]=C3
+
 std::bitset<4> readCols() {
   std::bitset<4> result;
   result[0] = digitalRead(C0_PIN);
@@ -64,8 +76,6 @@ std::bitset<4> readCols() {
   return result;
 }
 
-// Select a given row of the switch matrix (glitch-free).
-// Disable REN before changing address bits, then enable afterwards.
 void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, LOW);
 
@@ -74,6 +84,29 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(RA2_PIN, (rowIdx & 0x04) ? HIGH : LOW);
 
   digitalWrite(REN_PIN, HIGH);
+}
+
+
+
+void sampleISR() {
+  static uint32_t phaseAcc = 0;
+
+  // Debug count
+  isrCount++;
+
+  static uint32_t div = 0;
+  div++;
+  if (div >= 11000) {
+    div = 0;
+    digitalToggle(LED_BUILTIN);
+  }
+
+  phaseAcc += currentStepSize;
+
+  int32_t Vout = (int32_t)(phaseAcc >> 24) - 128;   // -128..127
+
+  analogWrite(OUTR_PIN, (uint8_t)(Vout + 128));
+
 }
 
 void setup() {
@@ -87,7 +120,7 @@ void setup() {
   pinMode(OUTR_PIN, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  // Columns: recommend pullups for active-low keys (pressed = 0)
+  // Columns: keys are active-low; pullups are the safe default
   pinMode(C0_PIN, INPUT_PULLUP);
   pinMode(C1_PIN, INPUT_PULLUP);
   pinMode(C2_PIN, INPUT_PULLUP);
@@ -96,52 +129,77 @@ void setup() {
   pinMode(JOYX_PIN, INPUT);
   pinMode(JOYY_PIN, INPUT);
 
-  //Initialise display
-  setOutMuxBit(DRST_BIT, LOW);    //Assert display logic reset
+  //Initialise display (starter code)
+  setOutMuxBit(DRST_BIT, LOW);
   delayMicroseconds(2);
-  setOutMuxBit(DRST_BIT, HIGH);   //Release display logic reset
+  setOutMuxBit(DRST_BIT, HIGH);
   u8g2.begin();
-  setOutMuxBit(DEN_BIT, HIGH);    //Enable display power supply
-  setOutMuxBit(KNOB_MODE, HIGH);  //Read knobs through key matrix (leave as starter)
+  setOutMuxBit(DEN_BIT, HIGH);
+  setOutMuxBit(KNOB_MODE, HIGH);
 
-  //Initialise UART
+  //UART
   Serial.begin(9600);
   Serial.println("Hello World");
+
+  analogWriteResolution(8);
+
+  sampleTimer.setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer.attachInterrupt(sampleISR);
+  sampleTimer.resume();
 }
 
 void loop() {
   static uint32_t next = millis();
 
-  while (millis() < next) {}  //Wait for next interval
+  while (millis() < next) {}
   next += interval;
 
-  // ----- Scan keys (rows 0..2 = 12 music keys) -----
   std::bitset<32> inputs;
 
   for (uint8_t row = 0; row < 3; row++) {
     setRow(row);
-    delayMicroseconds(3);          // settle time
+    delayMicroseconds(3);
     std::bitset<4> cols = readCols();
-
-    // Copy 4 bits into the appropriate slice
     for (uint8_t col = 0; col < 4; col++) {
       inputs[row * 4 + col] = cols[col];
     }
   }
 
-  // 12 key bits are inputs[0..11]
+  uint32_t localStep = 0;
+  int selectedKey = -1;
+
+  for (int k = 0; k < 12; k++) {
+    if (inputs[k] == 0) {
+      localStep = stepSizes[k];
+      selectedKey = k;
+    }
+  }
+
+  __atomic_store_n(&currentStepSize, localStep, __ATOMIC_RELAXED);
+
+  static uint32_t lastIsr = 0;
+  uint32_t nowIsr = isrCount;
+  uint32_t deltaIsr = nowIsr - lastIsr;
+  lastIsr = nowIsr;
+  uint32_t isrPerSec = deltaIsr * 10; // interval 100ms
+
   uint32_t key12 = inputs.to_ulong() & 0xFFF;
 
-  // ----- Update display -----
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(0, 10, "Keys / note / ISR/s");
 
-  u8g2.drawStr(0, 10, "Keys (12-bit hex):");
-  u8g2.setCursor(2, 28);
+  u8g2.setCursor(2, 22);
   u8g2.print(key12, HEX);
+
+  u8g2.setCursor(52, 22);
+  u8g2.print(selectedKey);
+
+  u8g2.setCursor(80, 22);
+  u8g2.print(isrPerSec);
 
   u8g2.sendBuffer();
 
-  //Toggle LED (keep this as per spec)
-  digitalToggle(LED_BUILTIN);
+  // NOTE: LED is now being toggled by ISR for debug
+  // so we do NOT toggle it here.
 }
