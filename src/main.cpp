@@ -3,18 +3,21 @@
 #include <bitset>
 #include <HardwareTimer.h>
 #include <STM32FreeRTOS.h>
-#include <ES_CAN.h>   // <- starter CAN wrapper (per brief)
+#include <ES_CAN.h>
 
-// ===== Constants =====
+#define TEST_ITERS 32
+// #define TEST_SCANKEYS
+// #define TEST_DISPLAY
+// #define TEST_DECODE
+// #define TEST_CAN_TX
+// #define TEST_AUDIO_ISR
+
 constexpr uint32_t AUDIO_FS_HZ = 22000;
-
-constexpr uint32_t SCAN_PERIOD_MS    = 20;   // improved knob accuracy
-constexpr uint32_t DISPLAY_PERIOD_MS = 100;  // per spec
-
+constexpr uint32_t SCAN_PERIOD_MS = 20;
+constexpr uint32_t DISPLAY_PERIOD_MS = 100;
 constexpr uint32_t CAN_ID = 0x123;
-constexpr uint8_t  OCTAVE = 4;              // fixed for now (per example)
+constexpr uint8_t OCTAVE = 4;
 
-// ===== Pins =====
 const int RA0_PIN = D3;
 const int RA1_PIN = D6;
 const int RA2_PIN = D12;
@@ -32,36 +35,33 @@ const int OUTR_PIN = A3;
 const int JOYY_PIN = A0;
 const int JOYX_PIN = A1;
 
-// Output mux bits
 const int KNOB_MODE = 2;
-const int DEN_BIT   = 3;
-const int DRST_BIT  = 4;
-const int HKOW_BIT  = 5;
-const int HKOE_BIT  = 6;
+const int DEN_BIT = 3;
+const int DRST_BIT = 4;
+const int HKOW_BIT = 5;
+const int HKOE_BIT = 6;
 
-// ===== Display =====
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-// ===== Shared system state =====
 struct {
   std::bitset<32> inputs;
-  volatile uint8_t knob3Rotation;      // 0..8 (atomic for ISR)
-  uint8_t lastRxMsg[8];                // latest received CAN payload
+  volatile uint8_t knob3Rotation;
+  uint8_t rxMsg[8];
   SemaphoreHandle_t mutex;
 } sysState;
 
-// ===== Audio =====
 volatile uint32_t currentStepSize = 0;
 HardwareTimer sampleTimer(TIM1);
 
-// 12 notes, A4=440Hz is index 9, fs=22kHz (S = (2^32*f)/fs rounded)
 const uint32_t stepSizes[12] = {
   51076057, 54113197, 57330935, 60740010,
   64351799, 68178356, 72232452, 76527617,
   81078186, 85899346, 91007187, 96418756
 };
 
-// ===== OUT mux helper (starter code) =====
+QueueHandle_t msgInQ = nullptr;
+QueueHandle_t msgOutQ = nullptr;
+
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
   digitalWrite(RA0_PIN, bitIdx & 0x01);
@@ -73,7 +73,6 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
 }
 
-// ===== Matrix helpers =====
 std::bitset<4> readCols() {
   std::bitset<4> r;
   r[0] = digitalRead(C0_PIN);
@@ -91,117 +90,138 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, HIGH);
 }
 
-// ===== Knob decode (Knob 3: row 3 col0=A, col1=B) =====
-// state encoded as {B,A} in bits: (B<<1)|A, A is bit0
 static inline int8_t decodeKnobDelta(uint8_t prevBA, uint8_t currBA) {
   if (prevBA == currBA) return 0;
-
   bool prevA = (prevBA & 0x01);
   bool currA = (currBA & 0x01);
-  if (prevA == currA) {
-    // A did not toggle -> intermediate state, no count
-    return 0;
-  }
-
-  // Counted transitions from the table
+  if (prevA == currA) return 0;
   if (prevBA == 0b00 && currBA == 0b01) return +1;
   if (prevBA == 0b01 && currBA == 0b00) return -1;
   if (prevBA == 0b10 && currBA == 0b11) return -1;
   if (prevBA == 0b11 && currBA == 0b10) return +1;
-
-  // Impossible transitions ignored for now
   return 0;
 }
 
-// ===== Audio ISR =====
 void sampleISR() {
   static uint32_t phaseAcc = 0;
-
   uint32_t step = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
   phaseAcc += step;
-
-  int32_t Vout = (int32_t)(phaseAcc >> 24) - 128; // -128..127
-
-  // volume: Vout = Vout >> (8 - knob3Rotation)
+  int32_t Vout = (int32_t)(phaseAcc >> 24) - 128;
   uint8_t vol = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
   if (vol > 8) vol = 8;
   Vout = Vout >> (8 - vol);
-
   uint8_t out = (uint8_t)(Vout + 128);
   analogWrite(OUTR_PIN, out);
   analogWrite(OUTL_PIN, out);
 }
 
-// ===== Tasks =====
-void scanKeysTask(void *pvParameters) {
-  (void)pvParameters;
+void CAN_RX_ISR(void) {
+  uint8_t RX_Message_ISR[8] = {0};
+  uint32_t ID = 0;
+  CAN_RX(ID, RX_Message_ISR);
+  if (msgInQ) {
+    xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+  }
+}
 
+static void scanKeysIterWorstCase() {
+  uint8_t TX_Message[8] = {0};
+  for (uint8_t note = 0; note < 12; note++) {
+    TX_Message[0] = (uint8_t)'P';
+    TX_Message[1] = OCTAVE;
+    TX_Message[2] = note;
+    xQueueSend(msgOutQ, TX_Message, 0);
+  }
+}
+
+static void displayIterWorstCase() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(0, 10, "display");
+  u8g2.setCursor(0, 22);
+  u8g2.print(micros());
+  u8g2.sendBuffer();
+  digitalToggle(LED_BUILTIN);
+}
+
+static void decodeIterWorstCase() {
+  uint8_t RX_Message[8] = {(uint8_t)'P', 4, 9, 0, 0, 0, 0, 0};
+
+  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+  for (int i = 0; i < 8; i++) sysState.rxMsg[i] = RX_Message[i];
+  xSemaphoreGive(sysState.mutex);
+
+  uint8_t type = RX_Message[0];
+  uint8_t oct = RX_Message[1];
+  uint8_t note = RX_Message[2];
+
+  if (type == (uint8_t)'R') {
+    __atomic_store_n(&currentStepSize, 0u, __ATOMIC_RELAXED);
+  } else if (type == (uint8_t)'P' && note < 12) {
+    uint32_t step = stepSizes[note];
+    if (oct > 4) step <<= (oct - 4);
+    else if (oct < 4) step >>= (4 - oct);
+    __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+  }
+}
+
+static void canTxIterWorstCase() {
+  uint8_t msgOut[8] = {(uint8_t)'P', OCTAVE, 0, 0, 0, 0, 0, 0};
+  CAN_TX(CAN_ID, msgOut);
+}
+
+void scanKeysTask(void *pvParameters) {
   const TickType_t xFrequency = SCAN_PERIOD_MS / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  // For knob decoding
   uint8_t prevKnob3BA = 0;
-
-  // For key press/release detection (only keys 0..11)
-  uint16_t prevKeys12 = 0x0FFF; // active-low, start as "all released" (1111...)
+  uint16_t prevKeys12 = 0x0FFF;
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
     std::bitset<32> localInputs;
 
-    // Scan rows 0..3 (row3 includes knob3 signals)
     for (uint8_t row = 0; row < 4; row++) {
       setRow(row);
       delayMicroseconds(3);
       std::bitset<4> cols = readCols();
-      for (uint8_t col = 0; col < 4; col++) {
-        localInputs[row * 4 + col] = cols[col];
-      }
+      for (uint8_t col = 0; col < 4; col++) localInputs[row * 4 + col] = cols[col];
     }
 
-    // ----- knob3 decode -----
     bool A = (localInputs[3 * 4 + 0] != 0);
     bool B = (localInputs[3 * 4 + 1] != 0);
     uint8_t currKnob3BA = ((uint8_t)B << 1) | (uint8_t)A;
-
     int8_t delta = decodeKnobDelta(prevKnob3BA, currKnob3BA);
     prevKnob3BA = currKnob3BA;
 
     uint8_t newRot = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
-    if (delta > 0) { if (newRot < 8) newRot++; }
-    else if (delta < 0) { if (newRot > 0) newRot--; }
+    if (delta > 0) {
+      if (newRot < 8) newRot++;
+    } else if (delta < 0) {
+      if (newRot > 0) newRot--;
+    }
     __atomic_store_n(&sysState.knob3Rotation, newRot, __ATOMIC_RELAXED);
 
-    // Publish inputs (mutex)
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.inputs = localInputs;
     xSemaphoreGive(sysState.mutex);
 
-    // ----- local note selection (still plays local keys) -----
     uint32_t localStep = 0;
-    for (int k = 0; k < 12; k++) {
-      if (localInputs[k] == 0) localStep = stepSizes[k];
-    }
+    for (int k = 0; k < 12; k++) if (localInputs[k] == 0) localStep = stepSizes[k];
     __atomic_store_n(&currentStepSize, localStep, __ATOMIC_RELAXED);
 
-    // ----- CAN key press/release messages -----
-    uint16_t keys12 = (uint16_t)(localInputs.to_ulong() & 0x0FFF); // bits are active-low
+    uint16_t keys12 = (uint16_t)(localInputs.to_ulong() & 0x0FFF);
 
-    // For each key, detect change from prev iteration
     for (uint8_t note = 0; note < 12; note++) {
       bool prevPressed = (((prevKeys12 >> note) & 0x1) == 0);
       bool currPressed = (((keys12 >> note) & 0x1) == 0);
-
       if (prevPressed != currPressed) {
         uint8_t TX_Message[8] = {0};
-
         TX_Message[0] = currPressed ? (uint8_t)'P' : (uint8_t)'R';
         TX_Message[1] = OCTAVE;
         TX_Message[2] = note;
-
-        // Send over CAN (polling inside library)
-        CAN_TX(CAN_ID, TX_Message);
+        xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
       }
     }
 
@@ -210,74 +230,78 @@ void scanKeysTask(void *pvParameters) {
 }
 
 void displayUpdateTask(void *pvParameters) {
-  (void)pvParameters;
-
   const TickType_t xFrequency = DISPLAY_PERIOD_MS / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    // Poll for received messages (loopback mode will receive our own TX)
-    uint32_t ID = 0;
-    uint8_t RX_Message[8] = {0};
-
-    while (CAN_CheckRXLevel()) {
-      CAN_RX(ID, RX_Message);
-
-      // store latest received message in sysState for display
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-      for (int i = 0; i < 8; i++) sysState.lastRxMsg[i] = RX_Message[i];
-      xSemaphoreGive(sysState.mutex);
-    }
-
-    // Copy shared state for display
     std::bitset<32> inputsCopy;
-    uint8_t msgCopy[8];
+    uint8_t rxCopy[8];
+
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     inputsCopy = sysState.inputs;
-    for (int i = 0; i < 8; i++) msgCopy[i] = sysState.lastRxMsg[i];
+    for (int i = 0; i < 8; i++) rxCopy[i] = sysState.rxMsg[i];
     xSemaphoreGive(sysState.mutex);
 
     uint32_t key12 = inputsCopy.to_ulong() & 0x0FFF;
 
     int selectedKey = -1;
-    for (int k = 0; k < 12; k++) {
-      if (inputsCopy[k] == 0) selectedKey = k;
-    }
+    for (int k = 0; k < 12; k++) if (inputsCopy[k] == 0) selectedKey = k;
 
     uint8_t vol = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
 
-    // Display
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-
-    u8g2.drawStr(0, 10, "Keys note vol  CAN");
+    u8g2.drawStr(0, 10, "Keys note vol CAN");
     u8g2.setCursor(2, 22);
     u8g2.print(key12, HEX);
-
     u8g2.setCursor(52, 22);
     u8g2.print(selectedKey);
-
     u8g2.setCursor(80, 22);
     u8g2.print(vol);
-
-    // Show latest CAN message (per brief format)
     u8g2.setCursor(66, 30);
-    u8g2.print((char)msgCopy[0]);
-    u8g2.print(msgCopy[1]);
-    u8g2.print(msgCopy[2]);
-
+    u8g2.print((char)rxCopy[0]);
+    u8g2.print(rxCopy[1]);
+    u8g2.print(rxCopy[2]);
     u8g2.sendBuffer();
-
-    // Spec: LED toggle in display task
     digitalToggle(LED_BUILTIN);
   }
 }
 
-// ===== Setup / Loop =====
-void setup() {
-  // GPIO
+void decodeTask(void *pvParameters) {
+  uint8_t RX_Message[8] = {0};
+  while (1) {
+    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    for (int i = 0; i < 8; i++) sysState.rxMsg[i] = RX_Message[i];
+    xSemaphoreGive(sysState.mutex);
+
+    uint8_t type = RX_Message[0];
+    uint8_t oct = RX_Message[1];
+    uint8_t note = RX_Message[2];
+
+    if (type == (uint8_t)'R') {
+      __atomic_store_n(&currentStepSize, 0u, __ATOMIC_RELAXED);
+    } else if (type == (uint8_t)'P' && note < 12) {
+      uint32_t step = stepSizes[note];
+      if (oct > 4) step <<= (oct - 4);
+      else if (oct < 4) step >>= (4 - oct);
+      __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+    }
+  }
+}
+
+void CAN_TX_Task(void *pvParameters) {
+  uint8_t msgOut[8] = {0};
+  while (1) {
+    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+    CAN_TX(CAN_ID, msgOut);
+  }
+}
+
+static void initPinsAndDisplay() {
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
   pinMode(RA2_PIN, OUTPUT);
@@ -297,49 +321,74 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  // Display init (starter)
   setOutMuxBit(DRST_BIT, LOW);
   delayMicroseconds(2);
   setOutMuxBit(DRST_BIT, HIGH);
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);
   setOutMuxBit(KNOB_MODE, HIGH);
-
-  // optional routing enables (harmless if unused)
   setOutMuxBit(HKOE_BIT, HIGH);
   setOutMuxBit(HKOW_BIT, HIGH);
+}
 
+void setup() {
   Serial.begin(9600);
-  Serial.println("Part 2 CAN polling start");
 
-  // Init sysState + mutex (before scheduler)
+  initPinsAndDisplay();
+
   sysState.inputs.reset();
-  sysState.knob3Rotation = 8; // loud by default
-  for (int i = 0; i < 8; i++) sysState.lastRxMsg[i] = 0;
+  sysState.knob3Rotation = 8;
+  for (int i = 0; i < 8; i++) sysState.rxMsg[i] = 0;
   sysState.mutex = xSemaphoreCreateMutex();
 
-  // Audio
   analogWriteResolution(8);
-  sampleTimer.setOverflow(AUDIO_FS_HZ, HERTZ_FORMAT);
-  sampleTimer.attachInterrupt(sampleISR);
-  sampleTimer.resume();
 
-  // CAN init (loopback = true for testing)
+#if defined(TEST_SCANKEYS) || defined(TEST_CAN_TX)
+  msgOutQ = xQueueCreate(384, 8);
+#else
+  msgOutQ = xQueueCreate(36, 8);
+#endif
+
+#if defined(TEST_SCANKEYS) || defined(TEST_DISPLAY) || defined(TEST_DECODE) || defined(TEST_CAN_TX) || defined(TEST_AUDIO_ISR)
   CAN_Init(true);
   setCANFilter(CAN_ID, 0x7ff);
   CAN_Start();
 
-  // Tasks
-  TaskHandle_t scanKeysHandle = NULL;
-  xTaskCreate(scanKeysTask, "scanKeys", 256, NULL, 2, &scanKeysHandle);
+  uint32_t startTime = micros();
+#if defined(TEST_SCANKEYS)
+  for (int i = 0; i < TEST_ITERS; i++) scanKeysIterWorstCase();
+#elif defined(TEST_DISPLAY)
+  for (int i = 0; i < TEST_ITERS; i++) displayIterWorstCase();
+#elif defined(TEST_DECODE)
+  for (int i = 0; i < TEST_ITERS; i++) decodeIterWorstCase();
+#elif defined(TEST_CAN_TX)
+  for (int i = 0; i < TEST_ITERS; i++) canTxIterWorstCase();
+#elif defined(TEST_AUDIO_ISR)
+  __atomic_store_n(&currentStepSize, stepSizes[9], __ATOMIC_RELAXED);
+  for (int i = 0; i < 32000; i++) sampleISR();
+#endif
+  uint32_t elapsed = micros() - startTime;
+  Serial.println(elapsed);
+  while (1) {}
+#else
+  msgInQ = xQueueCreate(36, 8);
 
-  TaskHandle_t displayHandle = NULL;
-  xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
+  CAN_Init(true);
+  setCANFilter(CAN_ID, 0x7ff);
+  CAN_RegisterRX_ISR(CAN_RX_ISR);
+  CAN_Start();
 
-  // Scheduler (must be last)
+  sampleTimer.setOverflow(AUDIO_FS_HZ, HERTZ_FORMAT);
+  sampleTimer.attachInterrupt(sampleISR);
+  sampleTimer.resume();
+
+  xTaskCreate(scanKeysTask, "scanKeys", 256, NULL, 3, NULL);
+  xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, NULL);
+  xTaskCreate(decodeTask, "decode", 256, NULL, 2, NULL);
+  xTaskCreate(CAN_TX_Task, "canTx", 256, NULL, 2, NULL);
+
   vTaskStartScheduler();
+#endif
 }
 
-void loop() {
-  // FreeRTOS: unused
-}
+void loop() {}
