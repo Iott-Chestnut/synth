@@ -1,21 +1,17 @@
-// main.cpp — Section 4 (FreeRTOS threading) FULL FILE
-// - scanKeysTask @ 50ms (priority 2)
-// - displayUpdateTask @ 100ms (priority 1, toggles LED per spec)
-// - sampleISR @ 22kHz timer (TIM1) generates sawtooth audio
-//
-// NOTE: I’ve included a mutex for sysState.inputs so you don’t hit the
-// “possible synchronisation bug” the brief mentions.
-
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <bitset>
 #include <HardwareTimer.h>
 #include <STM32FreeRTOS.h>
 
-//Constants
-const uint32_t intervalMs = 100; // display task interval (ms)
+// ===== Constants =====
+constexpr uint32_t AUDIO_FS_HZ = 22000;
 
-//Pin definitions
+// Task periods (per Part 2 knob suggestion)
+constexpr uint32_t SCAN_PERIOD_MS = 20;     // was 50, now 20ms to improve knob decode
+constexpr uint32_t DISPLAY_PERIOD_MS = 100; // per spec (also toggles LED)
+
+// ===== Pins =====
 const int RA0_PIN = D3;
 const int RA1_PIN = D6;
 const int RA2_PIN = D12;
@@ -33,28 +29,25 @@ const int OUTR_PIN = A3;
 const int JOYY_PIN = A0;
 const int JOYX_PIN = A1;
 
-//Output multiplexer bits
+// Output mux bits
 const int KNOB_MODE = 2;
 const int DEN_BIT   = 3;
 const int DRST_BIT  = 4;
 const int HKOW_BIT  = 5;
 const int HKOE_BIT  = 6;
 
-//Display
+// ===== Display =====
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-// Shared system state (per brief)
+// ===== Shared system state (per Part 2 Section 1) =====
 struct {
   std::bitset<32> inputs;
+  volatile uint8_t knob3Rotation;     // 0..8 (read by ISR via atomic)
+  SemaphoreHandle_t mutex;            // FreeRTOS mutex handle
 } sysState;
 
-// Mutex to protect sysState.inputs
-SemaphoreHandle_t sysStateMutex = nullptr;
-
-// Audio globals
+// ===== Audio =====
 volatile uint32_t currentStepSize = 0;
-
-// Timer for 22 kHz sampling (per brief)
 HardwareTimer sampleTimer(TIM1);
 
 // 12 notes (C..B), equal temperament, A4=440Hz is index 9, fs=22kHz
@@ -65,7 +58,7 @@ const uint32_t stepSizes[12] = {
   81078186, 85899346, 91007187, 96418756
 };
 
-// ---------- OUT MUX (starter code) ----------
+// ===== OUT mux helper (starter code) =====
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
   digitalWrite(RA0_PIN, bitIdx & 0x01);
@@ -77,7 +70,7 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
 }
 
-// ---------- Matrix helpers ----------
+// ===== Matrix helpers =====
 std::bitset<4> readCols() {
   std::bitset<4> r;
   r[0] = digitalRead(C0_PIN);
@@ -95,36 +88,71 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, HIGH);
 }
 
-// ---------- Audio ISR ----------
+// ===== Knob decode helper (Knob 3 = row 3, col0=A, col1=B) =====
+// We represent state as {B,A} in bits: (B<<1)|A, where A,B are 0/1.
+static inline int8_t decodeKnobDelta(uint8_t prevBA, uint8_t currBA) {
+  if (prevBA == currBA) return 0;
+
+  // Only count on transitions where A toggles (per brief)
+  bool prevA = (prevBA & 0x01);
+  bool currA = (currBA & 0x01);
+  bool aToggled = (prevA != currA);
+  if (!aToggled) {
+    // intermediate state (A unchanged) -> no count
+    return 0;
+  }
+
+  // Legal counted transitions (from the table):
+  // 00 -> 01 : +1
+  // 01 -> 00 : -1
+  // 10 -> 11 : -1
+  // 11 -> 10 : +1
+  if (prevBA == 0b00 && currBA == 0b01) return +1;
+  if (prevBA == 0b01 && currBA == 0b00) return -1;
+  if (prevBA == 0b10 && currBA == 0b11) return -1;
+  if (prevBA == 0b11 && currBA == 0b10) return +1;
+
+  // Impossible transitions or anything else -> ignore for now
+  return 0;
+}
+
+// ===== Audio ISR =====
 void sampleISR() {
   static uint32_t phaseAcc = 0;
 
-  // Read step size (ISR cannot be interrupted by same priority, so plain read is fine)
   uint32_t step = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
-
   phaseAcc += step;
 
   int32_t Vout = (int32_t)(phaseAcc >> 24) - 128; // -128..127
-  uint8_t out = (uint8_t)(Vout + 128);            // 0..255
 
-  // Drive both channels
+  // Volume from knob3Rotation (0..8), log-ish taper by shifting
+  uint8_t vol = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+  if (vol > 8) vol = 8; // safety clamp
+  Vout = Vout >> (8 - vol);
+
+  uint8_t out = (uint8_t)(Vout + 128);
+
   analogWrite(OUTR_PIN, out);
   analogWrite(OUTL_PIN, out);
 }
 
-// ---------- FreeRTOS Tasks ----------
+// ===== Tasks =====
 void scanKeysTask(void *pvParameters) {
   (void)pvParameters;
 
-  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  const TickType_t xFrequency = SCAN_PERIOD_MS / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  // Previous knob state {B,A}
+  uint8_t prevKnob3BA = 0;
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
     std::bitset<32> localInputs;
 
-    for (uint8_t row = 0; row < 3; row++) {
+    // Scan rows 0..3 (row 3 needed for knob 3 A/B)
+    for (uint8_t row = 0; row < 4; row++) {
       setRow(row);
       delayMicroseconds(3);
       std::bitset<4> cols = readCols();
@@ -133,21 +161,35 @@ void scanKeysTask(void *pvParameters) {
       }
     }
 
-    // Publish inputs (mutex-protected)
-    if (sysStateMutex) {
-      xSemaphoreTake(sysStateMutex, portMAX_DELAY);
-      sysState.inputs = localInputs;
-      xSemaphoreGive(sysStateMutex);
-    } else {
-      sysState.inputs = localInputs;
-    }
+    // Decode knob 3: row 3 col0=A, col1=B
+    // Inputs are active-low; convert to logical 0/1 where 1 means high.
+    // For quadrature, treat "pressed/closed" vs not doesn't matter; we want logic level.
+    bool A = (localInputs[3 * 4 + 0] != 0);
+    bool B = (localInputs[3 * 4 + 1] != 0);
+    uint8_t currKnob3BA = ((uint8_t)B << 1) | (uint8_t)A;
 
-    // Choose note (pressed = 0). Last pressed in scan order wins.
+    int8_t delta = decodeKnobDelta(prevKnob3BA, currKnob3BA);
+    prevKnob3BA = currKnob3BA;
+
+    // Update knob rotation with limits 0..8
+    uint8_t newRot = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+    if (delta > 0) {
+      if (newRot < 8) newRot++;
+    } else if (delta < 0) {
+      if (newRot > 0) newRot--;
+    }
+    __atomic_store_n(&sysState.knob3Rotation, newRot, __ATOMIC_RELAXED);
+
+    // Publish inputs to sysState (mutex protected)
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    sysState.inputs = localInputs;
+    xSemaphoreGive(sysState.mutex);
+
+    // Choose note (pressed = 0). Last key wins.
     uint32_t localStep = 0;
     for (int k = 0; k < 12; k++) {
       if (localInputs[k] == 0) localStep = stepSizes[k];
     }
-
     __atomic_store_n(&currentStepSize, localStep, __ATOMIC_RELAXED);
   }
 }
@@ -155,20 +197,17 @@ void scanKeysTask(void *pvParameters) {
 void displayUpdateTask(void *pvParameters) {
   (void)pvParameters;
 
-  const TickType_t xFrequency = intervalMs / portTICK_PERIOD_MS;
+  const TickType_t xFrequency = DISPLAY_PERIOD_MS / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
+    // Copy shared inputs under mutex (fast lock)
     std::bitset<32> inputsCopy;
-    if (sysStateMutex) {
-      xSemaphoreTake(sysStateMutex, portMAX_DELAY);
-      inputsCopy = sysState.inputs;
-      xSemaphoreGive(sysStateMutex);
-    } else {
-      inputsCopy = sysState.inputs;
-    }
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    inputsCopy = sysState.inputs;
+    xSemaphoreGive(sysState.mutex);
 
     uint32_t key12 = inputsCopy.to_ulong() & 0xFFF;
 
@@ -177,22 +216,31 @@ void displayUpdateTask(void *pvParameters) {
       if (inputsCopy[k] == 0) selectedKey = k;
     }
 
+    uint8_t vol = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(0, 10, "Keys / note");
+
+    u8g2.drawStr(0, 10, "Keys note vol");
     u8g2.setCursor(2, 22);
     u8g2.print(key12, HEX);
+
     u8g2.setCursor(52, 22);
     u8g2.print(selectedKey);
+
+    u8g2.setCursor(80, 22);
+    u8g2.print(vol);
+
     u8g2.sendBuffer();
 
-    // Spec: toggle LED in display task
+    // Spec: LED toggle in display task
     digitalToggle(LED_BUILTIN);
   }
 }
 
-// ---------- Setup / Loop ----------
+// ===== Setup / Loop =====
 void setup() {
+  // GPIO directions
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
   pinMode(RA2_PIN, OUTPUT);
@@ -225,30 +273,30 @@ void setup() {
   setOutMuxBit(HKOW_BIT, HIGH);
 
   Serial.begin(9600);
-  Serial.println("Hello World");
+  Serial.println("Part 2 start");
 
-  // Audio output config
+  // Init shared state + mutex (must be before scheduler)
+  sysState.inputs.reset();
+  sysState.knob3Rotation = 8;                // start loud
+  sysState.mutex = xSemaphoreCreateMutex();  // per brief
+
+  // Audio setup
   analogWriteResolution(8);
-
-  // Start audio timer ISR (22kHz)
-  sampleTimer.setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer.setOverflow(AUDIO_FS_HZ, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
 
-  // Create mutex
-  sysStateMutex = xSemaphoreCreateMutex();
-
-  // Create tasks (per brief stack sizes + priorities)
+  // Create tasks (scan higher priority than display)
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(scanKeysTask, "scanKeys", 64, NULL, 2, &scanKeysHandle);
 
   TaskHandle_t displayHandle = NULL;
   xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
 
-  // MUST start scheduler if FreeRTOS is a dependency
+  // Start scheduler (must be last)
   vTaskStartScheduler();
 }
 
 void loop() {
-  // FreeRTOS systems leave loop empty
+  // FreeRTOS: loop unused
 }
