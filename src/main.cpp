@@ -5,28 +5,30 @@
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
 
-#define TEST_ITERS 32
-// #define TEST_SCANKEYS
-// #define TEST_DISPLAY
-// #define TEST_DECODE
-// #define TEST_CAN_TX
-// #define TEST_AUDIO_ISR
+#define MODE_BOTH
+// #define MODE_SENDER
+// #define MODE_RECEIVER
 
-constexpr uint32_t AUDIO_FS_HZ = 22000;
-constexpr uint32_t SCAN_PERIOD_MS = 20;
-constexpr uint32_t DISPLAY_PERIOD_MS = 100;
-constexpr uint32_t CAN_ID = 0x123;
-constexpr uint8_t OCTAVE = 4;
+// IMPORTANT: octave switching disabled on purpose for debugging
+// (no joystick octave, fixed octave = 4)
 
+// ===== Timing / IDs =====
+constexpr uint32_t AUDIO_FS_HZ        = 22000;
+constexpr uint32_t SCAN_PERIOD_MS     = 20;
+constexpr uint32_t DISPLAY_PERIOD_MS  = 100;
+constexpr uint32_t CAN_ID             = 0x123;
+constexpr uint8_t  FIXED_OCTAVE       = 4;
+
+// ===== Pins =====
 const int RA0_PIN = D3;
 const int RA1_PIN = D6;
 const int RA2_PIN = D12;
 const int REN_PIN = A5;
 
-const int C0_PIN = A2;
-const int C1_PIN = D9;
-const int C2_PIN = A6;
-const int C3_PIN = D1;
+const int C0_PIN  = A2;
+const int C1_PIN  = D9;
+const int C2_PIN  = A6;
+const int C3_PIN  = D1;
 const int OUT_PIN = D11;
 
 const int OUTL_PIN = A4;
@@ -36,21 +38,26 @@ const int JOYY_PIN = A0;
 const int JOYX_PIN = A1;
 
 const int KNOB_MODE = 2;
-const int DEN_BIT = 3;
-const int DRST_BIT = 4;
-const int HKOW_BIT = 5;
-const int HKOE_BIT = 6;
+const int DEN_BIT   = 3;
+const int DRST_BIT  = 4;
+const int HKOW_BIT  = 5;
+const int HKOE_BIT  = 6;
 
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
 struct {
   std::bitset<32> inputs;
-  volatile uint8_t knob3Rotation;
+  volatile uint8_t knob3Rotation; // 0..8
   uint8_t rxMsg[8];
   SemaphoreHandle_t mutex;
 } sysState;
 
-volatile uint32_t currentStepSize = 0;
+volatile uint16_t localActiveMask  = 0;  // 12-bit
+volatile uint16_t remoteActiveMask = 0;  // 12-bit
+
+static uint8_t remoteOctBuf[2][12] = {{0}};
+volatile uint8_t remoteOctBufIdx = 0;
+
 HardwareTimer sampleTimer(TIM1);
 
 const uint32_t stepSizes[12] = {
@@ -59,7 +66,7 @@ const uint32_t stepSizes[12] = {
   81078186, 85899346, 91007187, 96418756
 };
 
-QueueHandle_t msgInQ = nullptr;
+QueueHandle_t msgInQ  = nullptr;
 QueueHandle_t msgOutQ = nullptr;
 
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
@@ -102,72 +109,77 @@ static inline int8_t decodeKnobDelta(uint8_t prevBA, uint8_t currBA) {
   return 0;
 }
 
+static inline int32_t triFromPhase(uint32_t phase) {
+  uint8_t x = (uint8_t)(phase >> 24);        
+  uint8_t t = (x < 128) ? x : (uint8_t)(255 - x); 
+  return ((int32_t)t << 1) - 128;              
+}
+
 void sampleISR() {
-  static uint32_t phaseAcc = 0;
-  uint32_t step = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
-  phaseAcc += step;
-  int32_t Vout = (int32_t)(phaseAcc >> 24) - 128;
+  static uint32_t phaseAccLocal[12]  = {0};
+  static uint32_t phaseAccRemote[12] = {0};
+
+  uint16_t lMask = __atomic_load_n(&localActiveMask, __ATOMIC_RELAXED);
+  uint16_t rMask = __atomic_load_n(&remoteActiveMask, __ATOMIC_RELAXED);
+
+#if defined(MODE_SENDER)
+  analogWrite(OUTR_PIN, 128);
+  analogWrite(OUTL_PIN, 128);
+  return;
+#elif defined(MODE_RECEIVER)
+  lMask = 0;
+#endif
+
+  uint8_t rIdx = __atomic_load_n(&remoteOctBufIdx, __ATOMIC_RELAXED);
+  const uint8_t *rOct = remoteOctBuf[rIdx];
+
+  int32_t mix = 0;
+  uint8_t voices = 0;
+
+
+  for (uint8_t n = 0; n < 12; n++) {
+    if (lMask & (1u << n)) {
+      phaseAccLocal[n] += stepSizes[n];
+      mix += triFromPhase(phaseAccLocal[n]);
+      voices++;
+    }
+  }
+
+  for (uint8_t n = 0; n < 12; n++) {
+    if (rMask & (1u << n)) {
+      (void)rOct; 
+      phaseAccRemote[n] += stepSizes[n];
+      mix += triFromPhase(phaseAccRemote[n]);
+      voices++;
+    }
+  }
+
+  if (voices == 0) {
+    analogWrite(OUTR_PIN, 128);
+    analogWrite(OUTL_PIN, 128);
+    return;
+  }
+
+  mix /= (int32_t)voices;
+
   uint8_t vol = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
   if (vol > 8) vol = 8;
-  Vout = Vout >> (8 - vol);
-  uint8_t out = (uint8_t)(Vout + 128);
-  analogWrite(OUTR_PIN, out);
-  analogWrite(OUTL_PIN, out);
+  mix = mix >> (8 - vol);
+
+  int32_t out = mix + 128;
+  if (out < 0) out = 0;
+  if (out > 255) out = 255;
+
+  analogWrite(OUTR_PIN, (uint8_t)out);
+  analogWrite(OUTL_PIN, (uint8_t)out);
 }
+
 
 void CAN_RX_ISR(void) {
   uint8_t RX_Message_ISR[8] = {0};
   uint32_t ID = 0;
   CAN_RX(ID, RX_Message_ISR);
-  if (msgInQ) {
-    xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
-  }
-}
-
-static void scanKeysIterWorstCase() {
-  uint8_t TX_Message[8] = {0};
-  for (uint8_t note = 0; note < 12; note++) {
-    TX_Message[0] = (uint8_t)'P';
-    TX_Message[1] = OCTAVE;
-    TX_Message[2] = note;
-    xQueueSend(msgOutQ, TX_Message, 0);
-  }
-}
-
-static void displayIterWorstCase() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, "display");
-  u8g2.setCursor(0, 22);
-  u8g2.print(micros());
-  u8g2.sendBuffer();
-  digitalToggle(LED_BUILTIN);
-}
-
-static void decodeIterWorstCase() {
-  uint8_t RX_Message[8] = {(uint8_t)'P', 4, 9, 0, 0, 0, 0, 0};
-
-  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-  for (int i = 0; i < 8; i++) sysState.rxMsg[i] = RX_Message[i];
-  xSemaphoreGive(sysState.mutex);
-
-  uint8_t type = RX_Message[0];
-  uint8_t oct = RX_Message[1];
-  uint8_t note = RX_Message[2];
-
-  if (type == (uint8_t)'R') {
-    __atomic_store_n(&currentStepSize, 0u, __ATOMIC_RELAXED);
-  } else if (type == (uint8_t)'P' && note < 12) {
-    uint32_t step = stepSizes[note];
-    if (oct > 4) step <<= (oct - 4);
-    else if (oct < 4) step >>= (4 - oct);
-    __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-  }
-}
-
-static void canTxIterWorstCase() {
-  uint8_t msgOut[8] = {(uint8_t)'P', OCTAVE, 0, 0, 0, 0, 0, 0};
-  CAN_TX(CAN_ID, msgOut);
+  if (msgInQ) xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
 void scanKeysTask(void *pvParameters) {
@@ -176,6 +188,9 @@ void scanKeysTask(void *pvParameters) {
 
   uint8_t prevKnob3BA = 0;
   uint16_t prevKeys12 = 0x0FFF;
+
+  uint16_t lastMask = 0;
+  uint16_t stableMask = 0;
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -189,6 +204,7 @@ void scanKeysTask(void *pvParameters) {
       for (uint8_t col = 0; col < 4; col++) localInputs[row * 4 + col] = cols[col];
     }
 
+
     bool A = (localInputs[3 * 4 + 0] != 0);
     bool B = (localInputs[3 * 4 + 1] != 0);
     uint8_t currKnob3BA = ((uint8_t)B << 1) | (uint8_t)A;
@@ -196,34 +212,44 @@ void scanKeysTask(void *pvParameters) {
     prevKnob3BA = currKnob3BA;
 
     uint8_t newRot = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
-    if (delta > 0) {
-      if (newRot < 8) newRot++;
-    } else if (delta < 0) {
-      if (newRot > 0) newRot--;
-    }
+    if (delta > 0) { if (newRot < 8) newRot++; }
+    else if (delta < 0) { if (newRot > 0) newRot--; }
     __atomic_store_n(&sysState.knob3Rotation, newRot, __ATOMIC_RELAXED);
 
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.inputs = localInputs;
     xSemaphoreGive(sysState.mutex);
 
-    uint32_t localStep = 0;
-    for (int k = 0; k < 12; k++) if (localInputs[k] == 0) localStep = stepSizes[k];
-    __atomic_store_n(&currentStepSize, localStep, __ATOMIC_RELAXED);
-
     uint16_t keys12 = (uint16_t)(localInputs.to_ulong() & 0x0FFF);
+    uint16_t mask = 0;
+    for (uint8_t note = 0; note < 12; note++) {
+      bool pressed = (((keys12 >> note) & 0x1) == 0);
+      if (pressed) mask |= (1u << note);
+    }
 
+    if (mask == lastMask) stableMask = mask;
+    lastMask = mask;
+
+#if defined(MODE_RECEIVER)
+    __atomic_store_n(&localActiveMask, 0u, __ATOMIC_RELAXED);
+#else
+    __atomic_store_n(&localActiveMask, stableMask, __ATOMIC_RELAXED);
+#endif
+
+
+#if !defined(MODE_RECEIVER)
     for (uint8_t note = 0; note < 12; note++) {
       bool prevPressed = (((prevKeys12 >> note) & 0x1) == 0);
       bool currPressed = (((keys12 >> note) & 0x1) == 0);
       if (prevPressed != currPressed) {
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currPressed ? (uint8_t)'P' : (uint8_t)'R';
-        TX_Message[1] = OCTAVE;
+        TX_Message[1] = FIXED_OCTAVE; // fixed
         TX_Message[2] = note;
         xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
       }
     }
+#endif
 
     prevKeys12 = keys12;
   }
@@ -250,20 +276,36 @@ void displayUpdateTask(void *pvParameters) {
     for (int k = 0; k < 12; k++) if (inputsCopy[k] == 0) selectedKey = k;
 
     uint8_t vol = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+    uint16_t lMask = __atomic_load_n(&localActiveMask, __ATOMIC_RELAXED);
+    uint16_t rMask = __atomic_load_n(&remoteActiveMask, __ATOMIC_RELAXED);
 
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(0, 10, "Keys note vol CAN");
+
+    u8g2.drawStr(0, 10, "Keys n v oct CAN");
     u8g2.setCursor(2, 22);
     u8g2.print(key12, HEX);
+
     u8g2.setCursor(52, 22);
     u8g2.print(selectedKey);
-    u8g2.setCursor(80, 22);
+
+    u8g2.setCursor(70, 22);
     u8g2.print(vol);
+
+    u8g2.setCursor(90, 22);
+    u8g2.print(FIXED_OCTAVE);
+
     u8g2.setCursor(66, 30);
     u8g2.print((char)rxCopy[0]);
     u8g2.print(rxCopy[1]);
     u8g2.print(rxCopy[2]);
+
+    u8g2.setCursor(0, 30);
+    u8g2.print("L");
+    u8g2.print(lMask, HEX);
+    u8g2.print(" R");
+    u8g2.print(rMask, HEX);
+
     u8g2.sendBuffer();
     digitalToggle(LED_BUILTIN);
   }
@@ -271,6 +313,14 @@ void displayUpdateTask(void *pvParameters) {
 
 void decodeTask(void *pvParameters) {
   uint8_t RX_Message[8] = {0};
+
+
+  for (int b = 0; b < 2; b++) {
+    for (int n = 0; n < 12; n++) remoteOctBuf[b][n] = FIXED_OCTAVE;
+  }
+  __atomic_store_n(&remoteOctBufIdx, 0u, __ATOMIC_RELAXED);
+  __atomic_store_n(&remoteActiveMask, 0u, __ATOMIC_RELAXED);
+
   while (1) {
     xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
 
@@ -278,26 +328,40 @@ void decodeTask(void *pvParameters) {
     for (int i = 0; i < 8; i++) sysState.rxMsg[i] = RX_Message[i];
     xSemaphoreGive(sysState.mutex);
 
+#if defined(MODE_SENDER)
+    continue;
+#else
     uint8_t type = RX_Message[0];
-    uint8_t oct = RX_Message[1];
+
     uint8_t note = RX_Message[2];
 
+    if (note >= 12) continue;
+
+    uint16_t rMask = __atomic_load_n(&remoteActiveMask, __ATOMIC_RELAXED);
+
     if (type == (uint8_t)'R') {
-      __atomic_store_n(&currentStepSize, 0u, __ATOMIC_RELAXED);
-    } else if (type == (uint8_t)'P' && note < 12) {
-      uint32_t step = stepSizes[note];
-      if (oct > 4) step <<= (oct - 4);
-      else if (oct < 4) step >>= (4 - oct);
-      __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+      rMask &= ~(1u << note);
+      __atomic_store_n(&remoteActiveMask, rMask, __ATOMIC_RELAXED);
+    } else if (type == (uint8_t)'P') {
+      rMask |= (1u << note);
+      __atomic_store_n(&remoteActiveMask, rMask, __ATOMIC_RELAXED);
+
+
     }
+#endif
   }
 }
+
 
 void CAN_TX_Task(void *pvParameters) {
   uint8_t msgOut[8] = {0};
   while (1) {
+#if defined(MODE_RECEIVER)
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+#else
     xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
     CAN_TX(CAN_ID, msgOut);
+#endif
   }
 }
 
@@ -343,35 +407,8 @@ void setup() {
 
   analogWriteResolution(8);
 
-#if defined(TEST_SCANKEYS) || defined(TEST_CAN_TX)
-  msgOutQ = xQueueCreate(384, 8);
-#else
+  msgInQ  = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(36, 8);
-#endif
-
-#if defined(TEST_SCANKEYS) || defined(TEST_DISPLAY) || defined(TEST_DECODE) || defined(TEST_CAN_TX) || defined(TEST_AUDIO_ISR)
-  CAN_Init(true);
-  setCANFilter(CAN_ID, 0x7ff);
-  CAN_Start();
-
-  uint32_t startTime = micros();
-#if defined(TEST_SCANKEYS)
-  for (int i = 0; i < TEST_ITERS; i++) scanKeysIterWorstCase();
-#elif defined(TEST_DISPLAY)
-  for (int i = 0; i < TEST_ITERS; i++) displayIterWorstCase();
-#elif defined(TEST_DECODE)
-  for (int i = 0; i < TEST_ITERS; i++) decodeIterWorstCase();
-#elif defined(TEST_CAN_TX)
-  for (int i = 0; i < TEST_ITERS; i++) canTxIterWorstCase();
-#elif defined(TEST_AUDIO_ISR)
-  __atomic_store_n(&currentStepSize, stepSizes[9], __ATOMIC_RELAXED);
-  for (int i = 0; i < 32000; i++) sampleISR();
-#endif
-  uint32_t elapsed = micros() - startTime;
-  Serial.println(elapsed);
-  while (1) {}
-#else
-  msgInQ = xQueueCreate(36, 8);
 
   CAN_Init(true);
   setCANFilter(CAN_ID, 0x7ff);
@@ -388,7 +425,6 @@ void setup() {
   xTaskCreate(CAN_TX_Task, "canTx", 256, NULL, 2, NULL);
 
   vTaskStartScheduler();
-#endif
 }
 
 void loop() {}
